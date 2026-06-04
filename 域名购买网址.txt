@@ -1,0 +1,5 @@
+域名购买网址：https://dash.domain.digitalplat.org/
+域名：suyeya.qzz.io
+服务器：rudy.ns.cloudflare.com
+服务器2：fish.ns.cloudflare.com
+存储和转图片url：https://dash.cloudflare.com/
