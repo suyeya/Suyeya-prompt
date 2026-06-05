@@ -19,6 +19,7 @@ const fieldNames = {
   detailContentImages: process.env.FEISHU_FIELD_DETAIL_CONTENT_IMAGES || "",
   status: process.env.FEISHU_FIELD_STATUS || "状态",
   sort: process.env.FEISHU_FIELD_SORT || "排序",
+  featuredSort: process.env.FEISHU_FIELD_FEATURED_SORT || "精选排序",
   createdAt: process.env.FEISHU_FIELD_CREATED_AT || "发布时间",
 };
 
@@ -184,10 +185,11 @@ function mapRecord(record) {
     detailImages: detailContentImages,
     createdAt: normalizeDate(fields[fieldNames.createdAt]),
     sort: Number(normalizeText(fields[fieldNames.sort])) || 0,
+    featuredSort: Number(normalizeText(fields[fieldNames.featuredSort])) || 0,
   };
 }
 
-export async function loadPromptsFromFeishu() {
+async function loadRecordsFromFeishu() {
   const appToken = requiredEnv("FEISHU_APP_TOKEN");
   const tableId = requiredEnv("FEISHU_TABLE_ID");
   const viewId = process.env.FEISHU_VIEW_ID;
@@ -214,6 +216,12 @@ export async function loadPromptsFromFeishu() {
     pageToken = data.data?.page_token || "";
   } while (pageToken);
 
+  return records;
+}
+
+export async function loadPromptsFromFeishu() {
+  const records = await loadRecordsFromFeishu();
+
   return records
     .filter((record) => {
       const fields = record.fields || {};
@@ -221,6 +229,72 @@ export async function loadPromptsFromFeishu() {
     })
     .map(mapRecord)
     .sort((a, b) => b.sort - a.sort || new Date(b.createdAt) - new Date(a.createdAt));
+}
+
+export async function updateFeaturedPromptsInFeishu(ids = []) {
+  const appToken = requiredEnv("FEISHU_APP_TOKEN");
+  const tableId = requiredEnv("FEISHU_TABLE_ID");
+  const token = await getTenantAccessToken();
+  const records = await loadRecordsFromFeishu();
+  const selectedIds = Array.from(new Set(ids.map(toFeishuText).filter(Boolean))).slice(0, 5);
+  const nextFeaturedSort = new Map(selectedIds.map((id, index) => [id, index + 1]));
+  const recordsToUpdate = records.filter((record) => {
+    const currentValue = Number(normalizeText(record.fields?.[fieldNames.featuredSort])) || 0;
+    const nextValue = nextFeaturedSort.get(record.record_id) || 0;
+    return currentValue !== nextValue;
+  });
+
+  await Promise.all(
+    recordsToUpdate.map((record) =>
+      requestJson(
+        `${FEISHU_BASE_URL}/bitable/v1/apps/${appToken}/tables/${tableId}/records/${record.record_id}`,
+        {
+          method: "PUT",
+          headers: {
+            Authorization: `Bearer ${token}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            fields: {
+              [fieldNames.featuredSort]: nextFeaturedSort.get(record.record_id) || 0,
+            },
+          }),
+        }
+      )
+    )
+  );
+
+  return loadPromptsFromFeishu();
+}
+
+export async function updatePromptTranslationInFeishu(recordId, translation = {}) {
+  const id = toFeishuText(recordId);
+  if (!id) throw new Error("记录 ID 不能为空");
+
+  const fields = {};
+  const chinese = toFeishuText(translation.chinese);
+  const english = toFeishuText(translation.english);
+
+  if (chinese) fields[fieldNames.chinese] = chinese;
+  if (english) fields[fieldNames.english] = english;
+  if (Object.keys(fields).length === 0) return null;
+
+  const appToken = requiredEnv("FEISHU_APP_TOKEN");
+  const tableId = requiredEnv("FEISHU_TABLE_ID");
+  const token = await getTenantAccessToken();
+  const data = await requestJson(
+    `${FEISHU_BASE_URL}/bitable/v1/apps/${appToken}/tables/${tableId}/records/${id}`,
+    {
+      method: "PUT",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ fields }),
+    }
+  );
+
+  return mapRecord(data.data?.record || data.data || { record_id: id, fields });
 }
 
 export async function createPromptInFeishu(input) {
@@ -249,6 +323,7 @@ export async function createPromptInFeishu(input) {
     [fieldNames.detailImages]: detailImages,
     [fieldNames.status]: toFeishuText(input.status) || "已发布",
     [fieldNames.sort]: Number(input.sort) || 0,
+    [fieldNames.featuredSort]: Number(input.featuredSort) || 0,
     [fieldNames.createdAt]: createdAt.getTime(),
   };
 
