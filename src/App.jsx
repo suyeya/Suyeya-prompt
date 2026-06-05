@@ -12,12 +12,14 @@ import {
   Languages,
   Plus,
   Search,
+  Star,
   Upload,
   X,
 } from "lucide-react";
 import "./styles.css";
 
 const STORAGE_KEY = "prompt-atlas-items-v1";
+const FEATURED_KEY = "prompt-atlas-featured-ids-v1";
 
 const samplePrompts = [
   {
@@ -129,6 +131,7 @@ function readStoredPrompts() {
     if (!stored) return samplePrompts;
     const parsed = JSON.parse(stored);
     if (!Array.isArray(parsed)) return samplePrompts;
+    if (!parsed.length) return samplePrompts;
     return parsed.map((item, index) => ({
       ...item,
       uploader:
@@ -139,6 +142,15 @@ function readStoredPrompts() {
     }));
   } catch {
     return samplePrompts;
+  }
+}
+
+function readFeaturedIds() {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(FEATURED_KEY) || "[]");
+    return Array.isArray(parsed) ? parsed.filter(Boolean).slice(0, 5) : [];
+  } catch {
+    return [];
   }
 }
 
@@ -270,19 +282,26 @@ function App() {
   const [featuredIndex, setFeaturedIndex] = useState(0);
   const [selectedId, setSelectedId] = useState(null);
   const [copiedDetail, setCopiedDetail] = useState(false);
+  const [formNotice, setFormNotice] = useState("");
+  const [featuredIds, setFeaturedIds] = useState(readFeaturedIds);
+  const [showFeaturedPicker, setShowFeaturedPicker] = useState(false);
   const formRef = useRef(null);
 
   useEffect(() => {
     let active = true;
 
     async function loadRemotePrompts() {
+      const controller = new AbortController();
+      const timeoutId = window.setTimeout(() => controller.abort(), 8000);
       try {
-        const response = await fetch("/api/prompts");
+        const response = await fetch("/api/prompts", { signal: controller.signal });
         if (!response.ok) throw new Error("Remote prompts unavailable");
         const data = await response.json();
-        if (active && Array.isArray(data.prompts)) {
+        if (active && Array.isArray(data.prompts) && data.prompts.length > 0) {
           setPrompts(data.prompts);
           setDataSource(data.source || "feishu");
+        } else {
+          throw new Error("Remote prompts empty");
         }
       } catch {
         if (active) {
@@ -290,6 +309,7 @@ function App() {
           setDataSource("local");
         }
       } finally {
+        window.clearTimeout(timeoutId);
         if (active) setIsSyncingRemote(false);
       }
     }
@@ -305,13 +325,34 @@ function App() {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(prompts));
   }, [prompts, dataSource]);
 
+  const featuredPrompts = useMemo(() => {
+    const selectedPrompts = featuredIds
+      .map((id) => prompts.find((item) => item.id === id))
+      .filter(Boolean);
+    return selectedPrompts.length ? selectedPrompts : prompts.slice(0, 5);
+  }, [featuredIds, prompts]);
+
   useEffect(() => {
-    if (!prompts.length) return undefined;
+    localStorage.setItem(FEATURED_KEY, JSON.stringify(featuredIds.slice(0, 5)));
+  }, [featuredIds]);
+
+  useEffect(() => {
+    if (!prompts.length || !featuredIds.length) return;
+    const validIds = new Set(prompts.map((item) => item.id));
+    setFeaturedIds((current) => current.filter((id) => validIds.has(id)).slice(0, 5));
+  }, [prompts, featuredIds.length]);
+
+  useEffect(() => {
+    if (!featuredPrompts.length) return undefined;
     const timer = window.setInterval(() => {
-      setFeaturedIndex((current) => (current + 1) % prompts.length);
+      setFeaturedIndex((current) => (current + 1) % featuredPrompts.length);
     }, 3600);
     return () => window.clearInterval(timer);
-  }, [prompts.length]);
+  }, [featuredPrompts.length]);
+
+  useEffect(() => {
+    setFeaturedIndex(0);
+  }, [featuredIds]);
 
   const types = useMemo(
     () => Array.from(new Set(prompts.map((item) => item.type).filter(Boolean))).sort(),
@@ -339,9 +380,9 @@ function App() {
         .toLowerCase();
       const matchesQuery = !keyword || pool.includes(keyword);
       const matchesFilter =
+        !["all", "type"].includes(activeFilter.kind) ||
         activeFilter.kind === "all" ||
-        (activeFilter.kind === "type" && item.type === activeFilter.value) ||
-        (activeFilter.kind === "tag" && item.tags?.includes(activeFilter.value));
+        (activeFilter.kind === "type" && item.type === activeFilter.value);
       return matchesQuery && matchesFilter;
     });
   }, [prompts, query, activeFilter]);
@@ -352,11 +393,13 @@ function App() {
   );
 
   function updateForm(field, value) {
+    if (formNotice) setFormNotice("");
     setForm((current) => ({ ...current, [field]: value }));
   }
 
   function resetForm() {
     setForm(emptyForm);
+    setFormNotice("");
   }
 
   async function uploadFileToUrl(file) {
@@ -489,9 +532,15 @@ function App() {
 
   async function handleSubmit(event) {
     event.preventDefault();
+    if (isSubmitting) return;
     const sourcePrompt = form.promptText.trim();
-    if (!form.title.trim() || !sourcePrompt) return;
+    if (!form.title.trim() || !sourcePrompt) {
+      setFormNotice("请先填写标题和提示词，再添加到收藏库。");
+      formRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+      return;
+    }
     setIsSubmitting(true);
+    setFormNotice("正在翻译并保存，请稍候。");
 
     const sourceIsEnglish = looksEnglish(sourcePrompt);
     let chinesePrompt = sourceIsEnglish ? "" : sourcePrompt;
@@ -554,7 +603,7 @@ function App() {
 
       if (!response.ok) {
         const message = await response.json().catch(() => ({}));
-        window.alert(message.error || "写入飞书失败，请检查权限。");
+        setFormNotice(message.error || "写入飞书失败，请检查权限。");
         setIsSubmitting(false);
         return;
       }
@@ -583,9 +632,18 @@ function App() {
   function goHome() {
     setSelectedId(null);
     setView("board");
+    setShowFeaturedPicker(false);
     setQuery("");
     setActiveFilter({ kind: "all", value: "全部" });
     window.scrollTo({ top: 0, behavior: "smooth" });
+  }
+
+  function toggleFeaturedPrompt(id) {
+    setFeaturedIds((current) => {
+      if (current.includes(id)) return current.filter((itemId) => itemId !== id);
+      if (current.length >= 5) return current;
+      return [...current, id];
+    });
   }
 
   async function copyPromptText(text) {
@@ -610,7 +668,7 @@ function App() {
           <span className="brand-mark">PA</span>
           <div>
             <h1>Suyeya prompt</h1>
-            <p>AI 提示词瀑布流管理</p>
+            <p>收集管理灵感提示词</p>
           </div>
         </button>
 
@@ -643,9 +701,21 @@ function App() {
             看板
           </button>
           <button
+            className={showFeaturedPicker ? "nav-button active" : "nav-button"}
+            onClick={() => {
+              setSelectedId(null);
+              setView("board");
+              setShowFeaturedPicker((current) => !current);
+            }}
+          >
+            <Star size={17} />
+            精选
+          </button>
+          <button
             className="primary-button"
             onClick={() => {
               resetForm();
+              setShowFeaturedPicker(false);
               setView("manage");
               window.setTimeout(() => formRef.current?.scrollIntoView({ behavior: "smooth" }), 50);
             }}
@@ -656,9 +726,18 @@ function App() {
         </div>
       </header>
 
+      {showFeaturedPicker && view === "board" && !selectedPrompt && (
+        <FeaturedPicker
+          prompts={prompts}
+          selectedIds={featuredIds}
+          onToggle={toggleFeaturedPrompt}
+          onClose={() => setShowFeaturedPicker(false)}
+        />
+      )}
+
       {view === "board" && !selectedPrompt && (
         <HeroPoster
-          prompts={prompts}
+          prompts={featuredPrompts}
           total={prompts.length}
           featuredIndex={featuredIndex}
           onFeaturedChange={setFeaturedIndex}
@@ -686,19 +765,6 @@ function App() {
               {type}
             </button>
           ))}
-          {tags.map((tag) => (
-            <button
-              key={tag}
-              className={
-                activeFilter.kind === "tag" && activeFilter.value === tag
-                  ? "filter-chip active tag"
-                  : "filter-chip tag"
-              }
-              onClick={() => setActiveFilter({ kind: "tag", value: tag })}
-            >
-              #{tag}
-            </button>
-          ))}
         </section>
       )}
 
@@ -718,6 +784,7 @@ function App() {
           typeOptions={types}
           tagOptions={tags}
           isSubmitting={isSubmitting}
+          formNotice={formNotice}
           onFormChange={updateForm}
           onImagesToField={uploadImagesToField}
           onImagePaste={handleImagePaste}
@@ -732,6 +799,55 @@ function App() {
   );
 }
 
+function FeaturedPicker({ prompts, selectedIds, onToggle, onClose }) {
+  const selectedCount = selectedIds.length;
+
+  return (
+    <section className="featured-picker" aria-label="首页精选设置">
+      <div className="featured-picker-head">
+        <div>
+          <strong>首页精选</strong>
+          <span>选择最多 5 张提示词卡片，用于首页右侧轮播展示。</span>
+        </div>
+        <button type="button" className="secondary-button" onClick={onClose}>
+          收起
+        </button>
+      </div>
+
+      <div className="featured-picker-count">已选择 {selectedCount} / 5</div>
+
+      <div className="featured-picker-grid">
+        {prompts.map((item) => {
+          const isSelected = selectedIds.includes(item.id);
+          const isDisabled = !isSelected && selectedCount >= 5;
+          return (
+            <button
+              type="button"
+              key={item.id}
+              className={isSelected ? "featured-option selected" : "featured-option"}
+              disabled={isDisabled}
+              onClick={() => onToggle(item.id)}
+            >
+              {item.image ? (
+                <img src={item.image} alt={item.title || "精选候选图"} />
+              ) : (
+                <span className="featured-option-empty">
+                  <ImagePlus size={18} />
+                </span>
+              )}
+              <span>
+                <strong>{item.title || "未命名提示词"}</strong>
+                <small>{item.type || "未分类"}</small>
+              </span>
+              <i>{isSelected ? "已选" : isDisabled ? "已满" : "选择"}</i>
+            </button>
+          );
+        })}
+      </div>
+    </section>
+  );
+}
+
 function HeroPoster({ prompts, total, featuredIndex, onFeaturedChange }) {
   const featured = prompts[featuredIndex % Math.max(prompts.length, 1)];
 
@@ -743,14 +859,13 @@ function HeroPoster({ prompts, total, featuredIndex, onFeaturedChange }) {
   return (
     <section className="hero-poster">
       <div className="hero-copy">
-        <span className="hero-badge">图像提示词 · 每日收录 · 免费整理</span>
+        <span className="hero-badge">每日收录 · 免费整理</span>
         <h2>
-          图像
-          <span>提示词</span>
+          灵感提示词
+          <span>资料库</span>
         </h2>
         <p>
-          为主流 AI 图像模型精选高质量提示词，覆盖 Nano Banana Pro、GPT Image 2、
-          Seedream、Midjourney 与 Stable Diffusion。
+          收集自己感兴趣的AIGC提示词库，覆盖图像、视频和网页提示词。持续追踪最新模型，每日上新。
         </p>
       </div>
 
@@ -758,7 +873,7 @@ function HeroPoster({ prompts, total, featuredIndex, onFeaturedChange }) {
         <div className="featured-card">
           <div className="featured-accent" />
           {featured?.image ? (
-            <img src={featured.image} alt={featured.title} />
+            <img src={featured.image} alt={featured.title || "精选提示词预览图"} />
           ) : (
             <div className="featured-empty">
               <ImagePlus size={32} />
@@ -816,17 +931,22 @@ function Board({ prompts, onOpen }) {
           }}
         >
           {item.image ? (
-            <img className="preview-image" src={item.image} alt={item.title} loading="lazy" />
+            <img
+              className="preview-image"
+              src={item.image}
+              alt={item.title || "提示词预览图"}
+              loading="lazy"
+            />
           ) : (
             <div className="preview-placeholder">
               <ImagePlus size={28} />
             </div>
           )}
           <div className="card-body">
-            <h2>{item.title}</h2>
+            <h2>{item.title || "未命名提示词"}</h2>
             <div className="display-meta">
               <span>@{item.uploader || "未命名"}</span>
-              <strong>{item.tool}</strong>
+              <strong>{item.tool || "未指定"}</strong>
             </div>
           </div>
         </article>
@@ -866,6 +986,15 @@ function PromptDetail({ item, copied, onBack, onCopy }) {
     }, 3000);
     return () => window.clearInterval(timer);
   }, [images.length, item.id]);
+
+  useEffect(() => {
+    if (!previewReference) return undefined;
+    function closeOnEscape(event) {
+      if (event.key === "Escape") setPreviewReference("");
+    }
+    window.addEventListener("keydown", closeOnEscape);
+    return () => window.removeEventListener("keydown", closeOnEscape);
+  }, [previewReference]);
 
   function moveImage(direction) {
     if (!images.length) return;
@@ -943,7 +1072,7 @@ function PromptDetail({ item, copied, onBack, onCopy }) {
             <div className="prompt-box-head">
               <strong>{promptLanguage === "chinese" ? "中文提示词" : "English Prompt"}</strong>
               <div className="prompt-head-actions">
-                <button type="button" onClick={() => onCopy(activePrompt)}>
+                <button type="button" onClick={() => onCopy(activePrompt)} disabled={!activePrompt}>
                   {copied ? <Check size={16} /> : <Copy size={16} />}
                   {copied ? "已复制" : "复制提示词"}
                 </button>
@@ -957,7 +1086,7 @@ function PromptDetail({ item, copied, onBack, onCopy }) {
                 </button>
               </div>
             </div>
-            <p>{activePrompt}</p>
+            <p>{activePrompt || "暂无提示词内容"}</p>
           </div>
 
         </article>
@@ -981,18 +1110,20 @@ function PromptDetail({ item, copied, onBack, onCopy }) {
             </div>
             <div>
               <span>模型</span>
-              <strong>{item.tool}</strong>
+              <strong>{item.tool || "未指定"}</strong>
             </div>
             <div>
               <span>分类</span>
-              <strong>{item.type}</strong>
+              <strong>{item.type || "未分类"}</strong>
             </div>
             <div>
               <span>标签</span>
               <div className="detail-tags">
-                {(item.tags || []).map((tag) => (
-                  <span key={tag}>{tag}</span>
-                ))}
+                {(item.tags || []).length > 0 ? (
+                  item.tags.map((tag) => <span key={tag}>{tag}</span>)
+                ) : (
+                  <span>未添加标签</span>
+                )}
               </div>
             </div>
           </section>
@@ -1005,11 +1136,17 @@ function PromptDetail({ item, copied, onBack, onCopy }) {
         onPreviewImage={setPreviewReference}
       />
       {previewReference && (
-        <div className="reference-modal" onClick={() => setPreviewReference("")}>
+        <div
+          className="reference-modal"
+          role="dialog"
+          aria-modal="true"
+          aria-label="图片预览"
+          onClick={() => setPreviewReference("")}
+        >
           <button type="button" aria-label="关闭参考图" onClick={() => setPreviewReference("")}>
             <X size={22} />
           </button>
-          <img src={previewReference} alt="参考图预览" />
+          <img src={previewReference} alt="参考图预览" onClick={(event) => event.stopPropagation()} />
         </div>
       )}
     </section>
@@ -1079,6 +1216,7 @@ function Manage({
   typeOptions,
   tagOptions,
   isSubmitting,
+  formNotice,
   onFormChange,
   onImagesToField,
   onImagePaste,
@@ -1088,26 +1226,19 @@ function Manage({
   onSubmit,
   onCancel,
 }) {
-  function addTag(tag) {
-    const current = parseTags(form.tagsInput);
-    if (current.includes(tag)) return;
-    onFormChange("tagsInput", [...current, tag].join("，"));
-  }
-
   return (
     <section className="manage-layout">
-      <form className="editor-panel" ref={formRef} onSubmit={onSubmit}>
+      <form className="editor-panel" ref={formRef} onSubmit={onSubmit} aria-busy={isSubmitting}>
         <div className="panel-heading">
           <div>
             <h2>新增提示词</h2>
-            <p>上传效果图，填写任意语言提示词，提交时自动生成中英文。</p>
           </div>
         </div>
 
         <div className="editor-form-columns">
           <div className="editor-main-fields">
         <div className="form-grid compact-fields">
-          <label>
+          <label className="plain-field">
             标题
             <input
               value={form.title}
@@ -1116,56 +1247,45 @@ function Manage({
               required
             />
           </label>
-          <label>
-            类型
-            <input
-              list="type-options"
-              value={form.type}
-              onChange={(event) => onFormChange("type", event.target.value)}
-              placeholder="产品爆炸图"
-            />
-            <datalist id="type-options">
-              {typeOptions.map((type) => (
-                <option key={type} value={type} />
-              ))}
-            </datalist>
-          </label>
+          <ComboInput
+            label="分类"
+            value={form.type}
+            options={typeOptions}
+            placeholder="产品场景图"
+            onChange={(value) => onFormChange("type", value)}
+            onSelect={(value) => onFormChange("type", value)}
+          />
         </div>
 
         <div className="form-grid compact-fields">
-          <label>
+          <label className="choice-field">
             生成工具
-            <input
-              value={form.tool}
-              onChange={(event) => onFormChange("tool", event.target.value)}
-              placeholder="Midjourney"
-            />
+            <div className={form.tool.trim() ? "choice-shell has-pills" : "choice-shell"}>
+              {form.tool.trim() && (
+                <div className="choice-pills" aria-hidden="true">
+                  <span className="choice-pill tone-3">{form.tool.trim()}</span>
+                </div>
+              )}
+              <input
+                value={form.tool}
+                onChange={(event) => onFormChange("tool", event.target.value)}
+                placeholder="GPT image 2"
+              />
+            </div>
           </label>
-          <label>
-            标签
-            <input
-              list="tag-options"
-              value={form.tagsInput}
-              onChange={(event) => onFormChange("tagsInput", event.target.value)}
-              placeholder="复古，3D渲染，赛博朋克"
-            />
-            <datalist id="tag-options">
-              {tagOptions.map((tag) => (
-                <option key={tag} value={tag} />
-              ))}
-            </datalist>
-          </label>
+          <ComboInput
+            label="标签"
+            value={form.tagsInput}
+            options={tagOptions}
+            placeholder="复古，3D渲染，赛博朋克"
+            onChange={(value) => onFormChange("tagsInput", value)}
+            onSelect={(value) => {
+              const currentTags = parseTags(form.tagsInput);
+              const nextTags = currentTags.includes(value) ? currentTags : [...currentTags, value];
+              onFormChange("tagsInput", nextTags.join("，"));
+            }}
+          />
         </div>
-
-        {tagOptions.length > 0 && (
-          <div className="suggestion-row form-wide">
-            {tagOptions.map((tag) => (
-              <button type="button" key={tag} onClick={() => addTag(tag)}>
-                #{tag}
-              </button>
-            ))}
-          </div>
-        )}
 
         <label className="prompt-field full-prompt-field">
           <span className="label-row">
@@ -1184,6 +1304,7 @@ function Manage({
             onChange={(event) => onFormChange("promptText", event.target.value)}
             placeholder="中文或英文都可以，提交时会自动补齐另一种语言"
             rows={3}
+            required
           />
         </label>
 
@@ -1224,11 +1345,20 @@ function Manage({
         </div>
 
         <div className="form-actions">
-          <button className="primary-button" type="submit">
+          {formNotice && (
+            <p className="form-notice" role="status">
+              {formNotice}
+            </p>
+          )}
+          <button
+            className="primary-button"
+            type="submit"
+            disabled={isSubmitting || !form.title.trim() || !form.promptText.trim()}
+          >
             <Check size={18} />
             {isSubmitting ? "翻译并写入中" : "添加提示词"}
           </button>
-          <button className="secondary-button" type="button" onClick={onCancel}>
+          <button className="secondary-button" type="button" onClick={onCancel} disabled={isSubmitting}>
             清空
           </button>
         </div>
@@ -1237,8 +1367,101 @@ function Manage({
   );
 }
 
+function ComboInput({ label, value, options, placeholder, onChange, onSelect }) {
+  const [isOpen, setIsOpen] = useState(false);
+  const cleanOptions = Array.from(new Set((options || []).filter(Boolean)));
+  const selectedValues = parseTags(value).slice(0, 3);
+  const shellClassName = [
+    isOpen ? "combo-shell open" : "combo-shell",
+    selectedValues.length > 0 ? "has-pills" : "",
+  ]
+    .filter(Boolean)
+    .join(" ");
+
+  function removeSelectedValue(valueToRemove) {
+    const nextValues = selectedValues.filter((selectedValue) => selectedValue !== valueToRemove);
+    onChange(nextValues.join("，"));
+    setIsOpen(false);
+  }
+
+  return (
+    <label className="combo-field">
+      <span>{label}</span>
+      <div className={shellClassName}>
+        {selectedValues.length > 0 && (
+          <div className="choice-pills">
+            {selectedValues.map((selectedValue, index) => (
+              <span className={`choice-pill tone-${(index % 5) + 1}`} key={selectedValue}>
+                <span className="choice-pill-text">{selectedValue}</span>
+                <button
+                  type="button"
+                  className="choice-remove"
+                  aria-label={`删除${selectedValue}`}
+                  onMouseDown={(event) => event.preventDefault()}
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    removeSelectedValue(selectedValue);
+                  }}
+                >
+                  <X size={10} strokeWidth={3} />
+                </button>
+              </span>
+            ))}
+          </div>
+        )}
+        <input
+          value={value}
+          onChange={(event) => {
+            onChange(event.target.value);
+            setIsOpen(true);
+          }}
+          onFocus={() => setIsOpen(true)}
+          onClick={() => setIsOpen(true)}
+          onBlur={() => window.setTimeout(() => setIsOpen(false), 120)}
+          placeholder={placeholder}
+          autoComplete="off"
+        />
+        <button
+          type="button"
+          className="combo-toggle"
+          aria-label={`展开${label}候选`}
+          onMouseDown={(event) => event.preventDefault()}
+          onClick={() => setIsOpen((current) => !current)}
+        >
+          <ChevronRight size={16} />
+        </button>
+        {isOpen && cleanOptions.length > 0 && (
+          <div className="combo-menu" role="listbox">
+            {cleanOptions.map((option) => (
+              <button
+                type="button"
+                key={option}
+                role="option"
+                onMouseDown={(event) => event.preventDefault()}
+                onClick={() => {
+                  onSelect(option);
+                  setIsOpen(false);
+                }}
+              >
+                {option}
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
+    </label>
+  );
+}
+
 function RichDetailEditor({ value, onFormChange, onImagesIntoText, onPasteIntoText }) {
   const textareaRef = useRef(null);
+
+  useEffect(() => {
+    const textarea = textareaRef.current;
+    if (!textarea) return;
+    textarea.style.height = "auto";
+    textarea.style.height = `${textarea.scrollHeight}px`;
+  }, [value]);
 
   async function handlePaste(event) {
     const files = Array.from(event.clipboardData?.files || []).filter((file) =>
@@ -1280,7 +1503,11 @@ function RichDetailEditor({ value, onFormChange, onImagesIntoText, onPasteIntoTe
       <textarea
         ref={textareaRef}
         value={value}
-        onChange={(event) => onFormChange("processText", event.target.value)}
+        onChange={(event) => {
+          event.target.style.height = "auto";
+          event.target.style.height = `${event.target.scrollHeight}px`;
+          onFormChange("processText", event.target.value);
+        }}
         onPaste={handlePaste}
         placeholder={"# 为什么这个提示词有效\n正文段落...\n> 这里可以写重点提示\n\n粘贴图片会自动插入到正文里"}
         rows={5}
@@ -1303,9 +1530,13 @@ function UploadModule({
 }) {
   const images = parseLines(value);
   const canAddMore = images.length < limit;
+  const moduleClassName = [
+    compact ? "upload-module compact-upload-module" : "upload-module",
+    `upload-${field}`,
+  ].join(" ");
 
   return (
-    <section className={compact ? "upload-module compact-upload-module" : "upload-module"}>
+    <section className={moduleClassName}>
       <div className="upload-module-head">
         <div>
           <strong>{title}</strong>
@@ -1322,7 +1553,10 @@ function UploadModule({
               accept="image/*"
               multiple
               disabled={!canAddMore}
-              onChange={(event) => onImagesToField(event.target.files, field, limit)}
+              onChange={async (event) => {
+                await onImagesToField(event.target.files, field, limit);
+                event.target.value = "";
+              }}
             />
           </label>
         </div>
