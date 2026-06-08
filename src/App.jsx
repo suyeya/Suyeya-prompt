@@ -4,12 +4,14 @@ import {
   ArrowLeft,
   CalendarDays,
   Check,
+  ChevronDown,
   ChevronLeft,
   ChevronRight,
   Copy,
   ImagePlus,
   LayoutDashboard,
   Languages,
+  Play,
   Plus,
   Search,
   SlidersHorizontal,
@@ -21,6 +23,11 @@ import "./styles.css";
 
 const STORAGE_KEY = "prompt-atlas-items-v1";
 const FEATURED_KEY = "prompt-atlas-featured-ids-v1";
+const MEDIUM_DEFINITIONS = [
+  { key: "image", label: "图像", accent: "coral", Icon: ImagePlus },
+  { key: "video", label: "视频", accent: "blue", Icon: Play },
+  { key: "web", label: "网页", accent: "green", Icon: LayoutDashboard },
+];
 
 const samplePrompts = [
   {
@@ -119,6 +126,7 @@ const emptyForm = {
   title: "",
   type: "",
   tool: "",
+  medium: "",
   promptText: "",
   tagsInput: "",
   resultImagesInput: "",
@@ -273,10 +281,18 @@ function parseDetailContent(content, fallbackImages = []) {
   return blocks;
 }
 
-function looksEnglish(text) {
-  const letters = (text.match(/[A-Za-z]/g) || []).length;
-  const chinese = (text.match(/[\u4e00-\u9fff]/g) || []).length;
-  return letters > chinese;
+function shouldStorePromptAsEnglish(text) {
+  const hasChinese = /[\u4e00-\u9fff]/.test(text);
+  const hasEnglishLetters = /[A-Za-z]/.test(text);
+  return hasEnglishLetters && !hasChinese;
+}
+
+function inferPromptMedium(item) {
+  const explicitMedium = normalizeText(String(item.medium || item.media || ""));
+  if (["video", "视频"].includes(explicitMedium)) return "video";
+  if (["web", "网页", "website"].includes(explicitMedium)) return "web";
+  if (["image", "图像", "图片"].includes(explicitMedium)) return "image";
+  return "";
 }
 
 function App() {
@@ -298,7 +314,10 @@ function App() {
   const [showFilterPanel, setShowFilterPanel] = useState(false);
   const [appliedFilters, setAppliedFilters] = useState({ types: [], tags: [], tools: [] });
   const [draftFilters, setDraftFilters] = useState({ types: [], tags: [], tools: [] });
+  const [activeMedium, setActiveMedium] = useState("");
+  const [quickFilterGroup, setQuickFilterGroup] = useState("types");
   const formRef = useRef(null);
+  const boardScrollTopRef = useRef(0);
 
   useEffect(() => {
     let active = true;
@@ -379,6 +398,20 @@ function App() {
     [prompts]
   );
 
+  const mediumStats = useMemo(
+    () =>
+      MEDIUM_DEFINITIONS.map((medium) => {
+        const items = prompts.filter((item) => inferPromptMedium(item) === medium.key);
+        const modelCount = new Set(items.map((item) => item.tool).filter(Boolean)).size;
+        return {
+          ...medium,
+          count: items.length,
+          modelCount,
+        };
+      }),
+    [prompts]
+  );
+
   const filteredPrompts = useMemo(() => {
     const keyword = normalizeText(query);
     const hasAdvancedFilters =
@@ -390,6 +423,7 @@ function App() {
         item.title,
         item.uploader,
         item.type,
+        item.medium,
         item.tool,
         item.chinese,
         item.english,
@@ -399,18 +433,48 @@ function App() {
         .toLowerCase();
       const matchesQuery = !keyword || pool.includes(keyword);
       const matchesFilter =
-        !["all", "type"].includes(activeFilter.kind) ||
         activeFilter.kind === "all" ||
-        (activeFilter.kind === "type" && item.type === activeFilter.value);
+        (activeFilter.kind === "type" && item.type === activeFilter.value) ||
+        (activeFilter.kind === "tag" && (item.tags || []).includes(activeFilter.value));
+      const matchesMedium = !activeMedium || inferPromptMedium(item) === activeMedium;
       const matchesAdvanced =
         !hasAdvancedFilters ||
         ((appliedFilters.types.length === 0 || appliedFilters.types.includes(item.type)) &&
           (appliedFilters.tags.length === 0 ||
             (item.tags || []).some((tag) => appliedFilters.tags.includes(tag))) &&
           (appliedFilters.tools.length === 0 || appliedFilters.tools.includes(item.tool)));
-      return matchesQuery && matchesFilter && matchesAdvanced;
+      return matchesQuery && matchesFilter && matchesMedium && matchesAdvanced;
     });
-  }, [prompts, query, activeFilter, appliedFilters]);
+  }, [prompts, query, activeFilter, activeMedium, appliedFilters]);
+
+  const visibleTypes = useMemo(() => {
+    const source = activeMedium
+      ? prompts.filter((item) => inferPromptMedium(item) === activeMedium)
+      : prompts;
+    return Array.from(new Set(source.map((item) => item.type).filter(Boolean))).sort();
+  }, [prompts, activeMedium]);
+
+  const visibleTags = useMemo(() => {
+    if (!activeMedium) return [];
+    const source = prompts.filter((item) => inferPromptMedium(item) === activeMedium);
+    return Array.from(new Set(source.flatMap((item) => item.tags || []).filter(Boolean))).sort();
+  }, [prompts, activeMedium]);
+
+  const activeMediumDefinition = useMemo(
+    () => MEDIUM_DEFINITIONS.find((item) => item.key === activeMedium) || null,
+    [activeMedium]
+  );
+
+  const mediumFilterOptions = useMemo(() => {
+    const source = activeMedium
+      ? prompts.filter((item) => inferPromptMedium(item) === activeMedium)
+      : prompts;
+    return {
+      types: Array.from(new Set(source.map((item) => item.type).filter(Boolean))).sort(),
+      tags: Array.from(new Set(source.flatMap((item) => item.tags || []))).sort(),
+      tools: Array.from(new Set(source.map((item) => item.tool).filter(Boolean))).sort(),
+    };
+  }, [prompts, activeMedium]);
 
   const selectedPrompt = useMemo(
     () => prompts.find((item) => item.id === selectedId) || null,
@@ -429,6 +493,28 @@ function App() {
   function resetForm() {
     setForm(emptyForm);
     setFormNotice("");
+  }
+
+  async function refreshPromptsFromRemote() {
+    if (dataSource !== "feishu") return;
+    try {
+      const response = await fetch("/api/prompts");
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok || !Array.isArray(data.prompts)) return;
+      setPrompts(data.prompts);
+      setFeaturedIds(getFeaturedIdsFromPrompts(data.prompts));
+      setDataSource(data.source || "feishu");
+    } catch {
+      // Keep the current optimistic item if a silent refresh fails.
+    }
+  }
+
+  function scheduleTranslationRefresh() {
+    [2500, 6500, 12000].forEach((delay) => {
+      window.setTimeout(() => {
+        refreshPromptsFromRemote();
+      }, delay);
+    });
   }
 
   async function uploadFileToUrl(file) {
@@ -568,10 +654,15 @@ function App() {
       formRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
       return;
     }
+    if (!MEDIUM_DEFINITIONS.some((item) => item.label === form.medium.trim())) {
+      setFormNotice("请选择图像、视频或网页中的一种媒介。");
+      formRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+      return;
+    }
     setIsSubmitting(true);
     setFormNotice("正在保存到飞书，翻译会在后台自动补齐。");
 
-    const sourceIsEnglish = looksEnglish(sourcePrompt);
+    const sourceIsEnglish = shouldStorePromptAsEnglish(sourcePrompt);
     const chinesePrompt = sourceIsEnglish ? "" : sourcePrompt;
     const englishPrompt = sourceIsEnglish ? sourcePrompt : "";
 
@@ -581,6 +672,7 @@ function App() {
       uploader: "Suyeya",
       type: form.type.trim() || "未分类",
       tool: form.tool.trim() || "未指定",
+      medium: form.medium.trim(),
       chinese: chinesePrompt,
       english: englishPrompt,
       tags: parseTags(form.tagsInput),
@@ -616,7 +708,9 @@ function App() {
 
       const data = await response.json();
       setPrompts((current) => [data.prompt || nextItem, ...current]);
+      scheduleTranslationRefresh();
       resetForm();
+      setActiveMedium("");
       setView("board");
       setIsSubmitting(false);
       return;
@@ -626,13 +720,23 @@ function App() {
       [nextItem, ...current]
     );
     resetForm();
+    setActiveMedium("");
     setView("board");
     setIsSubmitting(false);
   }
 
   function openPromptDetail(id) {
+    boardScrollTopRef.current = window.scrollY || window.pageYOffset || 0;
     setSelectedId(id);
     window.setTimeout(() => window.scrollTo({ top: 0, behavior: "smooth" }), 0);
+  }
+
+  function returnToPromptList() {
+    const scrollTop = boardScrollTopRef.current || 0;
+    setSelectedId(null);
+    window.requestAnimationFrame(() => {
+      window.scrollTo({ top: scrollTop, behavior: "auto" });
+    });
   }
 
   function goHome() {
@@ -641,6 +745,21 @@ function App() {
     setShowFeaturedPicker(false);
     setShowFilterPanel(false);
     setQuery("");
+    setActiveMedium("");
+    setActiveFilter({ kind: "all", value: "全部" });
+    setAppliedFilters({ types: [], tags: [], tools: [] });
+    setDraftFilters({ types: [], tags: [], tools: [] });
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  }
+
+  function openMediumPage(value) {
+    setSelectedId(null);
+    setView("board");
+    setShowFeaturedPicker(false);
+    setShowFilterPanel(false);
+    setQuery("");
+    setActiveMedium(value);
+    setQuickFilterGroup("types");
     setActiveFilter({ kind: "all", value: "全部" });
     setAppliedFilters({ types: [], tags: [], tools: [] });
     setDraftFilters({ types: [], tags: [], tools: [] });
@@ -687,6 +806,19 @@ function App() {
   function openFilterPanel() {
     setDraftFilters(appliedFilters);
     setShowFilterPanel((current) => !current);
+  }
+
+  function toggleQuickFilter(group, value) {
+    setActiveFilter({ kind: "all", value: "全部" });
+    setAppliedFilters((current) => {
+      const values = current[group] || [];
+      const nextValues = values.includes(value)
+        ? values.filter((item) => item !== value)
+        : [...values, value];
+      const nextFilters = { ...current, [group]: nextValues };
+      setDraftFilters(nextFilters);
+      return nextFilters;
+    });
   }
 
   function toggleDraftFilter(group, value) {
@@ -757,11 +889,8 @@ function App() {
             提示词收录总计：{isSyncingRemote ? "同步中" : prompts.length}
           </span>
           <button
-            className={view === "board" ? "nav-button active" : "nav-button"}
-            onClick={() => {
-              setSelectedId(null);
-              setView("board");
-            }}
+            className={view === "board" && !activeMedium ? "nav-button active" : "nav-button"}
+            onClick={goHome}
           >
             <LayoutDashboard size={17} />
             看板
@@ -770,6 +899,8 @@ function App() {
             className={showFeaturedPicker ? "nav-button active" : "nav-button"}
             onClick={() => {
               setSelectedId(null);
+              setActiveMedium("");
+              setActiveFilter({ kind: "all", value: "全部" });
               setView("board");
               setShowFeaturedPicker((current) => !current);
             }}
@@ -781,6 +912,7 @@ function App() {
             className="primary-button"
             onClick={() => {
               resetForm();
+              setActiveMedium("");
               setShowFeaturedPicker(false);
               setView("manage");
               window.setTimeout(() => formRef.current?.scrollIntoView({ behavior: "smooth" }), 50);
@@ -792,7 +924,7 @@ function App() {
         </div>
       </header>
 
-      {showFeaturedPicker && view === "board" && !selectedPrompt && (
+      {showFeaturedPicker && view === "board" && !selectedPrompt && !activeMedium && (
         <FeaturedPicker
           prompts={prompts}
           selectedIds={featuredIds}
@@ -802,7 +934,7 @@ function App() {
         />
       )}
 
-      {view === "board" && !selectedPrompt && (
+      {view === "board" && !selectedPrompt && !activeMedium && (
         <HeroPoster
           prompts={featuredPrompts}
           total={prompts.length}
@@ -812,7 +944,34 @@ function App() {
         />
       )}
 
-      {view === "board" && !selectedPrompt && (
+      {view === "board" && !selectedPrompt && !activeMedium && (
+        <MediumBrowser
+          items={mediumStats}
+          onSelect={openMediumPage}
+        />
+      )}
+
+      {view === "board" && !selectedPrompt && activeMediumDefinition && (
+        <MediumPageHeader
+          definition={activeMediumDefinition}
+          count={filteredPrompts.length}
+          onBack={goHome}
+        />
+      )}
+
+      {view === "board" && !selectedPrompt && activeMedium && (
+        <QuickFilterRail
+          activeGroup={quickFilterGroup}
+          filters={appliedFilters}
+          options={{ types: visibleTypes, tags: visibleTags }}
+          isPanelOpen={showFilterPanel}
+          onGroupChange={setQuickFilterGroup}
+          onToggle={toggleQuickFilter}
+          onOpenPanel={openFilterPanel}
+        />
+      )}
+
+      {view === "board" && !selectedPrompt && !activeMedium && (
         <section className="filter-strip" aria-label="筛选">
           <button
             className={
@@ -827,7 +986,7 @@ function App() {
           >
             全部
           </button>
-          {types.map((type) => (
+          {visibleTypes.map((type) => (
             <button
               key={type}
               className={
@@ -841,6 +1000,22 @@ function App() {
               }}
             >
               {type}
+            </button>
+          ))}
+          {visibleTags.map((tag) => (
+            <button
+              key={tag}
+              className={
+                activeFilter.kind === "tag" && activeFilter.value === tag
+                  ? "filter-chip tag active"
+                  : "filter-chip tag"
+              }
+              onClick={() => {
+                setActiveFilter({ kind: "tag", value: tag });
+                setAppliedFilters({ types: [], tags: [], tools: [] });
+              }}
+            >
+              #{tag}
             </button>
           ))}
           <button
@@ -861,7 +1036,7 @@ function App() {
         <div className="filter-modal-backdrop" onClick={() => setShowFilterPanel(false)}>
           <AdvancedFilterPanel
             filters={draftFilters}
-            options={{ types, tags, tools }}
+            options={mediumFilterOptions}
             onToggle={toggleDraftFilter}
             onApply={applyDraftFilters}
             onClear={clearDraftFilters}
@@ -874,11 +1049,19 @@ function App() {
         <PromptDetail
           item={selectedPrompt}
           copied={copiedDetail}
-          onBack={() => setSelectedId(null)}
+          onBack={returnToPromptList}
           onCopy={copyPromptText}
         />
       ) : view === "board" ? (
-        <Board prompts={filteredPrompts} onOpen={openPromptDetail} />
+        <Board
+          prompts={filteredPrompts}
+          onOpen={openPromptDetail}
+          layout={
+            activeMedium || activeFilter.kind !== "all" || hasAppliedFilters
+              ? "packed"
+              : "masonry"
+          }
+        />
       ) : (
         <Manage
           form={form}
@@ -947,6 +1130,126 @@ function FeaturedPicker({ prompts, selectedIds, isSaving, onToggle, onClose }) {
           );
         })}
       </div>
+    </section>
+  );
+}
+
+function MediumBrowser({ items, onSelect }) {
+  return (
+    <section className="medium-browser" aria-label="按媒介浏览">
+      <h2>按媒介浏览</h2>
+      <div className="medium-grid">
+        {items.map(({ key, label, accent, Icon }) => (
+          <button
+            type="button"
+            key={key}
+            className={`medium-card ${accent}`}
+            onClick={() => onSelect(key)}
+          >
+            <span className="medium-icon">
+              <Icon size={24} strokeWidth={2.4} />
+            </span>
+            <ChevronRight className="medium-arrow" size={22} />
+            <strong>{label}</strong>
+          </button>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function MediumPageHeader({ definition, count, onBack }) {
+  const { label, accent, Icon } = definition;
+  return (
+    <section className={`medium-page-header ${accent}`}>
+      <button type="button" className="back-button" onClick={onBack}>
+        <ArrowLeft size={18} />
+        返回首页
+      </button>
+      <div className="medium-page-title">
+        <span className="medium-icon">
+          <Icon size={26} strokeWidth={2.4} />
+        </span>
+        <div>
+          <p>按媒介浏览</p>
+          <h2>{label}提示词</h2>
+        </div>
+        <strong>{count.toLocaleString("zh-CN")} 条</strong>
+      </div>
+    </section>
+  );
+}
+
+function QuickFilterRail({
+  activeGroup,
+  filters,
+  options,
+  isPanelOpen,
+  onGroupChange,
+  onToggle,
+  onOpenPanel,
+}) {
+  const items = options[activeGroup] || [];
+  const selectedValues = filters[activeGroup] || [];
+
+  return (
+    <section className="quick-filter-rail" aria-label="分类和标签筛选">
+      <div className="quick-filter-tabs" role="tablist" aria-label="筛选类型">
+        {[
+          { key: "types", label: "分类" },
+          { key: "tags", label: "标签" },
+        ].map((group) => {
+          const count = filters[group.key].length;
+          return (
+            <button
+              type="button"
+              role="tab"
+              aria-selected={activeGroup === group.key}
+              className={activeGroup === group.key ? "active" : ""}
+              key={group.key}
+              onClick={() => onGroupChange(group.key)}
+            >
+              {group.label}
+              {count > 0 && <span>{count}</span>}
+            </button>
+          );
+        })}
+      </div>
+
+      <div className="quick-filter-divider" />
+
+      <div className="quick-filter-options">
+        {items.length > 0 ? (
+          items.map((item, index) => {
+            const isSelected = selectedValues.includes(item);
+            return (
+              <button
+                type="button"
+                className={isSelected ? `quick-filter-pill selected tone-${(index % 5) + 1}` : "quick-filter-pill"}
+                aria-pressed={isSelected}
+                key={item}
+                onClick={() => onToggle(activeGroup, item)}
+              >
+                {activeGroup === "tags" ? `#${item}` : item}
+              </button>
+            );
+          })
+        ) : (
+          <span className="quick-filter-empty">
+            当前媒介还没有{activeGroup === "types" ? "分类" : "标签"}
+          </span>
+        )}
+      </div>
+
+      <button
+        type="button"
+        className={isPanelOpen ? "quick-filter-more active" : "quick-filter-more"}
+        onClick={onOpenPanel}
+        aria-label="打开完整筛选"
+        aria-expanded={isPanelOpen}
+      >
+        <ChevronDown size={20} />
+      </button>
     </section>
   );
 }
@@ -1145,7 +1448,7 @@ function HeroPoster({ prompts, total, featuredIndex, onFeaturedChange, onOpen })
   );
 }
 
-function Board({ prompts, onOpen }) {
+function Board({ prompts, onOpen, layout = "masonry" }) {
   if (!prompts.length) {
     return (
       <section className="empty-state">
@@ -1156,44 +1459,80 @@ function Board({ prompts, onOpen }) {
     );
   }
 
+  const isPacked = layout === "packed" || prompts.length <= 4;
+
   return (
-    <section className="masonry" aria-label="提示词瀑布流">
+    <section className={isPacked ? "masonry packed-results" : "masonry"} aria-label="提示词瀑布流">
       {prompts.map((item) => (
-        <article
-          className="prompt-card"
+        <PromptCard
           key={item.id}
-          role="button"
-          tabIndex={0}
-          onClick={() => onOpen(item.id)}
-          onKeyDown={(event) => {
-            if (event.key === "Enter" || event.key === " ") {
-              event.preventDefault();
-              onOpen(item.id);
-            }
-          }}
-        >
-          {item.image ? (
-            <img
-              className="preview-image"
-              src={item.image}
-              alt={item.title || "提示词预览图"}
-              loading="lazy"
-            />
-          ) : (
-            <div className="preview-placeholder">
-              <ImagePlus size={28} />
-            </div>
-          )}
-          <div className="card-body">
-            <h2>{item.title || "未命名提示词"}</h2>
-            <div className="display-meta">
-              <span>@{item.uploader || "未命名"}</span>
-              <strong>{item.tool || "未指定"}</strong>
-            </div>
-          </div>
-        </article>
+          item={item}
+          packed={isPacked}
+          onOpen={onOpen}
+        />
       ))}
     </section>
+  );
+}
+
+function PromptCard({ item, packed, onOpen }) {
+  const cardRef = useRef(null);
+
+  useEffect(() => {
+    if (!packed || !cardRef.current || typeof ResizeObserver === "undefined") return undefined;
+    const card = cardRef.current;
+
+    function updateSpan() {
+      const grid = card.parentElement;
+      if (!grid) return;
+      const styles = window.getComputedStyle(grid);
+      const rowHeight = Number.parseFloat(styles.gridAutoRows) || 1;
+      const cardGap =
+        Number.parseFloat(styles.getPropertyValue("--masonry-card-gap")) || 24;
+      const height = card.getBoundingClientRect().height;
+      card.style.setProperty("--masonry-span", Math.ceil((height + cardGap) / rowHeight));
+    }
+
+    const observer = new ResizeObserver(() => window.requestAnimationFrame(updateSpan));
+    observer.observe(card);
+    updateSpan();
+    return () => observer.disconnect();
+  }, [packed, item.id]);
+
+  return (
+    <article
+      ref={cardRef}
+      className="prompt-card"
+      role="button"
+      tabIndex={0}
+      onClick={() => onOpen(item.id)}
+      onKeyDown={(event) => {
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          onOpen(item.id);
+        }
+      }}
+    >
+      {item.image ? (
+        <img
+          className="preview-image"
+          src={item.image}
+          alt={item.title || "提示词预览图"}
+          loading="lazy"
+        />
+      ) : (
+        <div className="preview-placeholder">
+          <ImagePlus size={28} />
+        </div>
+      )}
+      <div className="card-body">
+        <h2>{item.title || "未命名提示词"}</h2>
+        <div className="display-meta">
+          <span>@{item.uploader || "未命名"}</span>
+          <strong>{item.tool || "未指定"}</strong>
+        </div>
+      </div>
+    </article>
   );
 }
 
@@ -1222,14 +1561,6 @@ function PromptDetail({ item, copied, onBack, onCopy }) {
   }, [item.id]);
 
   useEffect(() => {
-    if (images.length <= 1) return undefined;
-    const timer = window.setInterval(() => {
-      setImageIndex((current) => (current + 1) % images.length);
-    }, 3000);
-    return () => window.clearInterval(timer);
-  }, [images.length, item.id]);
-
-  useEffect(() => {
     if (!previewReference) return undefined;
     function closeOnEscape(event) {
       if (event.key === "Escape") setPreviewReference("");
@@ -1253,29 +1584,42 @@ function PromptDetail({ item, copied, onBack, onCopy }) {
       <div className="detail-grid">
         <article className="detail-main">
           <div className="breadcrumb">提示词 / 图像 / {item.title}</div>
-          <span className="detail-type">图像提示词</span>
           <h2>{item.title}</h2>
 
           <div className="detail-image-wrap">
             {activeImage ? (
-              <img className="detail-image" src={activeImage} alt={item.title} />
+              <button
+                type="button"
+                className="detail-image-button"
+                onClick={() => setPreviewReference(activeImage)}
+                aria-label="查看预览大图"
+              >
+                <img className="detail-image" src={activeImage} alt={item.title} />
+              </button>
             ) : (
               <div className="detail-image-empty">
                 <ImagePlus size={40} />
               </div>
             )}
             {images.length > 1 && (
-              <div className="detail-image-controls">
-                <button type="button" onClick={() => moveImage(-1)} aria-label="上一张详情图">
-                  <ChevronLeft size={18} />
+              <>
+                <button
+                  type="button"
+                  className="detail-image-arrow previous"
+                  onClick={() => moveImage(-1)}
+                  aria-label="上一张详情图"
+                >
+                  <ChevronLeft size={22} />
                 </button>
-                <span>
-                  {imageIndex + 1} / {images.length}
-                </span>
-                <button type="button" onClick={() => moveImage(1)} aria-label="下一张详情图">
-                  <ChevronRight size={18} />
+                <button
+                  type="button"
+                  className="detail-image-arrow next"
+                  onClick={() => moveImage(1)}
+                  aria-label="下一张详情图"
+                >
+                  <ChevronRight size={22} />
                 </button>
-              </div>
+              </>
             )}
             {images.length > 1 && (
               <div className="detail-image-dots">
@@ -1500,7 +1844,7 @@ function Manage({
           />
         </div>
 
-        <div className="form-grid compact-fields">
+        <div className="form-grid compact-fields with-wide-tag">
           <ComboInput
             label="生成工具"
             value={form.tool}
@@ -1509,6 +1853,16 @@ function Manage({
             maxSelected={1}
             onChange={(value) => onFormChange("tool", value)}
             onSelect={(value) => onFormChange("tool", value)}
+          />
+          <ComboInput
+            label="媒介"
+            value={form.medium}
+            options={MEDIUM_DEFINITIONS.map((item) => item.label)}
+            placeholder="请选择媒介"
+            maxSelected={1}
+            allowCustom={false}
+            onChange={(value) => onFormChange("medium", value)}
+            onSelect={(value) => onFormChange("medium", value)}
           />
           <ComboInput
             label="标签"
@@ -1604,7 +1958,16 @@ function Manage({
   );
 }
 
-function ComboInput({ label, value, options, placeholder, maxSelected = 1, onChange, onSelect }) {
+function ComboInput({
+  label,
+  value,
+  options,
+  placeholder,
+  maxSelected = 1,
+  allowCustom = true,
+  onChange,
+  onSelect,
+}) {
   const [isOpen, setIsOpen] = useState(false);
   const cleanOptions = Array.from(new Set((options || []).filter(Boolean)));
   const selectedValues = parseTags(value).slice(0, maxSelected);
@@ -1664,6 +2027,7 @@ function ComboInput({ label, value, options, placeholder, maxSelected = 1, onCha
         <input
           value={value}
           onChange={(event) => {
+            if (!allowCustom) return;
             onChange(event.target.value);
             setIsOpen(true);
           }}
@@ -1672,6 +2036,7 @@ function ComboInput({ label, value, options, placeholder, maxSelected = 1, onCha
           onBlur={() => window.setTimeout(() => setIsOpen(false), 120)}
           placeholder={placeholder}
           autoComplete="off"
+          readOnly={!allowCustom}
         />
         <button
           type="button"

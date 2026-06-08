@@ -9,6 +9,7 @@ const fieldNames = {
   uploader: process.env.FEISHU_FIELD_UPLOADER || "上传人",
   tool: process.env.FEISHU_FIELD_TOOL || "模型",
   type: process.env.FEISHU_FIELD_TYPE || "类型",
+  medium: process.env.FEISHU_FIELD_MEDIUM || "媒介",
   chinese: process.env.FEISHU_FIELD_CHINESE || "中文提示词",
   english: process.env.FEISHU_FIELD_ENGLISH || "英文提示词",
   tags: process.env.FEISHU_FIELD_TAGS || "标签",
@@ -120,6 +121,10 @@ function toFeishuText(value) {
   return value == null ? "" : String(value).trim();
 }
 
+function hasChineseText(value) {
+  return /[\u4e00-\u9fff]/.test(toFeishuText(value));
+}
+
 function toFeishuTags(value) {
   if (Array.isArray(value)) return value.map(toFeishuText).filter(Boolean);
   return normalizeTags(value);
@@ -175,6 +180,7 @@ function mapRecord(record) {
     uploader: normalizeText(fields[fieldNames.uploader]) || "未命名",
     type: normalizeText(fields[fieldNames.type]) || "未分类",
     tool: normalizeText(fields[fieldNames.tool]) || "未指定",
+    medium: normalizeText(fields[fieldNames.medium]),
     chinese: normalizeText(fields[fieldNames.chinese]),
     english: normalizeText(fields[fieldNames.english]),
     tags: normalizeTags(fields[fieldNames.tags]),
@@ -310,14 +316,22 @@ export async function createPromptInFeishu(input) {
     input.detailImages || input.detailContentImagesInput || input.processImagesInput
   );
   const createdAt = input.createdAt ? new Date(input.createdAt) : new Date();
+  let chinesePrompt = toFeishuText(input.chinese);
+  let englishPrompt = toFeishuText(input.english);
+
+  if (hasChineseText(englishPrompt) && (!chinesePrompt || chinesePrompt === englishPrompt)) {
+    chinesePrompt = chinesePrompt || englishPrompt;
+    englishPrompt = "";
+  }
 
   const fields = {
     [fieldNames.title]: toFeishuText(input.title),
     [fieldNames.uploader]: toFeishuText(input.uploader) || "未命名",
     [fieldNames.tool]: toFeishuText(input.tool) || "未指定",
     [fieldNames.type]: toFeishuText(input.type) || "未分类",
-    [fieldNames.chinese]: toFeishuText(input.chinese),
-    [fieldNames.english]: toFeishuText(input.english),
+    [fieldNames.medium]: toFeishuText(input.medium),
+    [fieldNames.chinese]: chinesePrompt,
+    [fieldNames.english]: englishPrompt,
     [fieldNames.tags]: tags,
     [fieldNames.cover]: coverUrl,
     [fieldNames.detailImages]: detailImages,

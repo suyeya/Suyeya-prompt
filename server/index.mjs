@@ -77,7 +77,18 @@ async function translatePromptInBackground(prompt) {
   if (!prompt?.id) return;
   const chinese = String(prompt.chinese || "").trim();
   const english = String(prompt.english || "").trim();
-  if (chinese && english) return;
+  const englishHasChinese = /[\u4e00-\u9fff]/.test(english);
+  if (chinese && english && !englishHasChinese) return;
+
+  if (englishHasChinese) {
+    const sourceText = chinese || english;
+    const translated = await translateText(sourceText, "zh-en");
+    await updatePromptTranslationInFeishu(prompt.id, {
+      chinese: sourceText,
+      english: translated.text,
+    });
+    return;
+  }
 
   const sourceIsEnglish = Boolean(english && !chinese);
   const sourceText = sourceIsEnglish ? english : chinese;
@@ -199,6 +210,10 @@ const server = http.createServer(async (request, response) => {
 
     if (request.method === "POST" && url.pathname === "/api/prompts") {
       const body = await readJsonBody(request);
+      if (!["图像", "视频", "网页"].includes(String(body.medium || "").trim())) {
+        sendJson(response, 400, { error: "请选择图像、视频或网页中的一种媒介。" });
+        return;
+      }
       const prompt = await createPromptInFeishu(body);
       sendJson(response, 201, { source: "feishu", prompt });
       if (body.autoTranslate !== false) {
