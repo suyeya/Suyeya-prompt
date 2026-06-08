@@ -1,5 +1,7 @@
 import http from "node:http";
-import { createHash } from "node:crypto";
+import { createHash, timingSafeEqual } from "node:crypto";
+import { createReadStream, existsSync, statSync } from "node:fs";
+import { extname, resolve, sep } from "node:path";
 import { URL } from "node:url";
 import {
   createPromptInFeishu,
@@ -12,7 +14,10 @@ import { uploadDataUrlToR2 } from "./services/r2.mjs";
 
 loadEnvFile();
 
-const port = Number(process.env.API_PORT || 8787);
+const port = Number(process.env.PORT || process.env.API_PORT || 8787);
+const host = process.env.HOST || "0.0.0.0";
+const adminToken = String(process.env.ADMIN_TOKEN || "").trim();
+const distDir = resolve(process.cwd(), "dist");
 const googleTranslateTimeoutMs = Number(process.env.GOOGLE_TRANSLATE_TIMEOUT_MS || 4_000);
 const baiduTranslateTimeoutMs = Number(process.env.BAIDU_TRANSLATE_TIMEOUT_MS || 12_000);
 const customTranslateTimeoutMs = Number(process.env.TRANSLATION_API_TIMEOUT_MS || 12_000);
@@ -46,6 +51,81 @@ function readJsonBody(request) {
     });
     request.on("error", rejectBody);
   });
+}
+
+function isAdminAuthorized(request) {
+  if (!adminToken) return true;
+  const authorization = String(request.headers.authorization || "");
+  const providedToken = authorization.startsWith("Bearer ") ? authorization.slice(7).trim() : "";
+  if (!providedToken) return false;
+  const expected = Buffer.from(adminToken);
+  const provided = Buffer.from(providedToken);
+  return expected.length === provided.length && timingSafeEqual(expected, provided);
+}
+
+function requireAdmin(request, response) {
+  if (isAdminAuthorized(request)) return true;
+  sendJson(response, 401, { error: "需要管理员口令。" });
+  return false;
+}
+
+const contentTypes = {
+  ".css": "text/css; charset=utf-8",
+  ".gif": "image/gif",
+  ".html": "text/html; charset=utf-8",
+  ".ico": "image/x-icon",
+  ".jpeg": "image/jpeg",
+  ".jpg": "image/jpeg",
+  ".js": "text/javascript; charset=utf-8",
+  ".json": "application/json; charset=utf-8",
+  ".png": "image/png",
+  ".svg": "image/svg+xml",
+  ".webp": "image/webp",
+};
+
+function serveFile(request, response, filePath, pathname) {
+  const extension = extname(filePath).toLowerCase();
+  response.writeHead(200, {
+    "Content-Type": contentTypes[extension] || "application/octet-stream",
+    "Cache-Control": pathname.startsWith("/assets/")
+      ? "public, max-age=31536000, immutable"
+      : "no-cache",
+  });
+  if (request.method === "HEAD") {
+    response.end();
+    return;
+  }
+  createReadStream(filePath).pipe(response);
+}
+
+function serveFrontend(request, response, url) {
+  if (!["GET", "HEAD"].includes(request.method) || !existsSync(distDir)) return false;
+
+  let pathname;
+  try {
+    pathname = decodeURIComponent(url.pathname);
+  } catch {
+    return false;
+  }
+
+  const relativePath = pathname === "/" ? "index.html" : pathname.replace(/^\/+/, "");
+  const requestedPath = resolve(distDir, relativePath);
+  const isInsideDist = requestedPath === distDir || requestedPath.startsWith(`${distDir}${sep}`);
+  if (!isInsideDist) return false;
+
+  if (existsSync(requestedPath) && statSync(requestedPath).isFile()) {
+    serveFile(request, response, requestedPath, pathname);
+    return true;
+  }
+
+  if (!extname(pathname)) {
+    const indexPath = resolve(distDir, "index.html");
+    if (existsSync(indexPath)) {
+      serveFile(request, response, indexPath, "/index.html");
+      return true;
+    }
+  }
+  return false;
 }
 
 async function translateText(text, direction) {
@@ -198,6 +278,7 @@ const server = http.createServer(async (request, response) => {
     if (request.method === "GET" && url.pathname === "/api/config") {
       sendJson(response, 200, {
         feishuTableUrl: process.env.FEISHU_TABLE_URL || "",
+        adminProtected: Boolean(adminToken),
       });
       return;
     }
@@ -209,6 +290,7 @@ const server = http.createServer(async (request, response) => {
     }
 
     if (request.method === "POST" && url.pathname === "/api/prompts") {
+      if (!requireAdmin(request, response)) return;
       const body = await readJsonBody(request);
       if (!["图像", "视频", "网页"].includes(String(body.medium || "").trim())) {
         sendJson(response, 400, { error: "请选择图像、视频或网页中的一种媒介。" });
@@ -229,6 +311,7 @@ const server = http.createServer(async (request, response) => {
     }
 
     if (request.method === "PUT" && url.pathname === "/api/featured") {
+      if (!requireAdmin(request, response)) return;
       const body = await readJsonBody(request);
       const prompts = await updateFeaturedPromptsInFeishu(body.ids || []);
       sendJson(response, 200, { source: "feishu", prompts });
@@ -236,6 +319,7 @@ const server = http.createServer(async (request, response) => {
     }
 
     if (request.method === "POST" && url.pathname === "/api/uploads") {
+      if (!requireAdmin(request, response)) return;
       const body = await readJsonBody(request);
       const uploadedUrl = await uploadDataUrlToR2(body.dataUrl, body.filename);
       sendJson(response, 201, { url: uploadedUrl });
@@ -243,12 +327,19 @@ const server = http.createServer(async (request, response) => {
     }
 
     if (request.method === "POST" && url.pathname === "/api/translate") {
+      if (!requireAdmin(request, response)) return;
       const body = await readJsonBody(request);
       const translated = await translateText(body.text, body.direction);
       sendJson(response, 200, translated);
       return;
     }
 
+    if (url.pathname.startsWith("/api/")) {
+      sendJson(response, 404, { error: "Not found" });
+      return;
+    }
+
+    if (serveFrontend(request, response, url)) return;
     sendJson(response, 404, { error: "Not found" });
   } catch (error) {
     sendJson(response, 500, {
@@ -257,6 +348,6 @@ const server = http.createServer(async (request, response) => {
   }
 });
 
-server.listen(port, "127.0.0.1", () => {
-  console.log(`Prompt Atlas API listening on http://127.0.0.1:${port}`);
+server.listen(port, host, () => {
+  console.log(`Prompt Atlas listening on http://${host}:${port}`);
 });

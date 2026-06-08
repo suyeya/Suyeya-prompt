@@ -23,6 +23,7 @@ import "./styles.css";
 
 const STORAGE_KEY = "prompt-atlas-items-v1";
 const FEATURED_KEY = "prompt-atlas-featured-ids-v1";
+const ADMIN_TOKEN_KEY = "prompt-atlas-admin-token";
 const MEDIUM_DEFINITIONS = [
   { key: "image", label: "图像", accent: "coral", Icon: ImagePlus },
   { key: "video", label: "视频", accent: "blue", Icon: Play },
@@ -287,6 +288,32 @@ function shouldStorePromptAsEnglish(text) {
   return hasEnglishLetters && !hasChinese;
 }
 
+async function adminFetch(url, options = {}) {
+  let token = sessionStorage.getItem(ADMIN_TOKEN_KEY) || "";
+
+  async function sendRequest() {
+    return fetch(url, {
+      ...options,
+      headers: {
+        ...(options.headers || {}),
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      },
+    });
+  }
+
+  let response = await sendRequest();
+  if (response.status !== 401) return response;
+
+  sessionStorage.removeItem(ADMIN_TOKEN_KEY);
+  token = window.prompt("请输入管理员口令")?.trim() || "";
+  if (!token) return response;
+
+  sessionStorage.setItem(ADMIN_TOKEN_KEY, token);
+  response = await sendRequest();
+  if (response.status === 401) sessionStorage.removeItem(ADMIN_TOKEN_KEY);
+  return response;
+}
+
 function inferPromptMedium(item) {
   const explicitMedium = normalizeText(String(item.medium || item.media || ""));
   if (["video", "视频"].includes(explicitMedium)) return "video";
@@ -524,16 +551,20 @@ function App() {
       reader.onload = async () => {
         const dataUrl = String(reader.result);
         try {
-          const response = await fetch("/api/uploads", {
+          const response = await adminFetch("/api/uploads", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ dataUrl, filename: file.name }),
           });
-          if (!response.ok) throw new Error("图片上传失败");
+          if (!response.ok) {
+            const message = await response.json().catch(() => ({}));
+            throw new Error(message.error || "图片上传失败");
+          }
           const data = await response.json();
-          resolve(data.url || dataUrl);
-        } catch {
-          resolve(dataUrl);
+          resolve(data.url || "");
+        } catch (error) {
+          window.alert(error instanceof Error ? error.message : "图片上传失败");
+          resolve("");
         }
       };
       reader.readAsDataURL(file);
@@ -543,7 +574,7 @@ function App() {
   async function uploadImagesToField(files, field, limit = Infinity) {
     const imageFiles = Array.from(files || []).filter((file) => file.type.startsWith("image/"));
     if (!imageFiles.length) return;
-    const urls = await Promise.all(imageFiles.map((file) => uploadFileToUrl(file)));
+    const urls = (await Promise.all(imageFiles.map((file) => uploadFileToUrl(file)))).filter(Boolean);
     setForm((current) => ({
       ...current,
       [field]: appendLines(current[field], urls, limit),
@@ -583,7 +614,8 @@ function App() {
   async function insertImagesIntoText(files, field, selectionStart, selectionEnd) {
     const imageFiles = Array.from(files || []).filter((file) => file.type.startsWith("image/"));
     if (!imageFiles.length) return;
-    const urls = await Promise.all(imageFiles.map((file) => uploadFileToUrl(file)));
+    const urls = (await Promise.all(imageFiles.map((file) => uploadFileToUrl(file)))).filter(Boolean);
+    if (!urls.length) return;
     const insertText = urls.map((url) => `![图片](${url})`).join("\n\n");
 
     setForm((current) => {
@@ -623,6 +655,7 @@ function App() {
   async function uploadImageFile(file) {
     if (!file) return;
     const url = await uploadFileToUrl(file);
+    if (!url) return;
     updateForm("resultImagesInput", appendLines(form.resultImagesInput, [url]));
   }
 
@@ -632,16 +665,20 @@ function App() {
 
   async function uploadDataUrl(dataUrl, filename = "image.png") {
       try {
-        const response = await fetch("/api/uploads", {
+        const response = await adminFetch("/api/uploads", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ dataUrl, filename }),
         });
-        if (!response.ok) throw new Error("图片上传失败");
+        if (!response.ok) {
+          const message = await response.json().catch(() => ({}));
+          throw new Error(message.error || "图片上传失败");
+        }
         const data = await response.json();
-        return data.url || dataUrl;
-      } catch {
-        return dataUrl;
+        return data.url || "";
+      } catch (error) {
+        window.alert(error instanceof Error ? error.message : "图片上传失败");
+        return "";
       }
   }
 
@@ -685,7 +722,7 @@ function App() {
     };
 
     if (dataSource === "feishu") {
-      const response = await fetch("/api/prompts", {
+      const response = await adminFetch("/api/prompts", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -784,7 +821,7 @@ function App() {
 
     setIsSavingFeatured(true);
     try {
-      const response = await fetch("/api/featured", {
+      const response = await adminFetch("/api/featured", {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ ids: nextIds }),

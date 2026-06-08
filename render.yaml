@@ -1,0 +1,82 @@
+services:
+  - type: web
+    name: suyeya-prompt
+    runtime: node
+    plan: free
+    region: singapore
+    branch: chugao
+    buildCommand: npm ci && npm run build
+    startCommand: npm start
+    healthCheckPath: /api/health
+    autoDeployTrigger: commit
+    envVars:
+      - key: NODE_VERSION
+        value: "20"
+      - key: ADMIN_TOKEN
+        sync: false
+      - key: FEISHU_APP_ID
+        sync: false
+      - key: FEISHU_APP_SECRET
+        sync: false
+      - key: FEISHU_APP_TOKEN
+        sync: false
+      - key: FEISHU_TABLE_ID
+        sync: false
+      - key: FEISHU_TABLE_URL
+        sync: false
+      - key: FEISHU_VIEW_ID
+        sync: false
+      - key: FEISHU_FIELD_TITLE
+        sync: false
+      - key: FEISHU_FIELD_UPLOADER
+        sync: false
+      - key: FEISHU_FIELD_TOOL
+        sync: false
+      - key: FEISHU_FIELD_TYPE
+        sync: false
+      - key: FEISHU_FIELD_MEDIUM
+        sync: false
+      - key: FEISHU_FIELD_CHINESE
+        sync: false
+      - key: FEISHU_FIELD_ENGLISH
+        sync: false
+      - key: FEISHU_FIELD_TAGS
+        sync: false
+      - key: FEISHU_FIELD_COVER
+        sync: false
+      - key: FEISHU_FIELD_DETAIL_IMAGES
+        sync: false
+      - key: FEISHU_FIELD_REFERENCE_IMAGES
+        sync: false
+      - key: FEISHU_FIELD_DETAIL_TEXT
+        sync: false
+      - key: FEISHU_FIELD_DETAIL_CONTENT_IMAGES
+        sync: false
+      - key: FEISHU_FIELD_STATUS
+        sync: false
+      - key: FEISHU_FIELD_SORT
+        sync: false
+      - key: FEISHU_FIELD_FEATURED_SORT
+        sync: false
+      - key: FEISHU_FIELD_CREATED_AT
+        sync: false
+      - key: GOOGLE_TRANSLATE_API_KEY
+        sync: false
+      - key: GOOGLE_TRANSLATE_TIMEOUT_MS
+        value: "4000"
+      - key: BAIDU_TRANSLATE_APP_ID
+        sync: false
+      - key: BAIDU_TRANSLATE_SECRET_KEY
+        sync: false
+      - key: BAIDU_TRANSLATE_TIMEOUT_MS
+        value: "12000"
+      - key: R2_ACCOUNT_ID
+        sync: false
+      - key: R2_ACCESS_KEY_ID
+        sync: false
+      - key: R2_SECRET_ACCESS_KEY
+        sync: false
+      - key: R2_BUCKET
+        sync: false
+      - key: R2_PUBLIC_BASE_URL
+        sync: false
