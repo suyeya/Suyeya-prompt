@@ -131,6 +131,7 @@ const emptyForm = {
   promptText: "",
   tagsInput: "",
   resultImagesInput: "",
+  resultThumbnailsInput: "",
   referenceImagesInput: "",
   processText: "",
 };
@@ -323,8 +324,8 @@ function inferPromptMedium(item) {
 }
 
 function App() {
-  const [prompts, setPrompts] = useState([]);
-  const [dataSource, setDataSource] = useState("local");
+  const [prompts, setPrompts] = useState(() => readStoredPrompts());
+  const [dataSource, setDataSource] = useState("cache");
   const [isSyncingRemote, setIsSyncingRemote] = useState(true);
   const [query, setQuery] = useState("");
   const [activeFilter, setActiveFilter] = useState({ kind: "all", value: "全部" });
@@ -353,7 +354,10 @@ function App() {
       const controller = new AbortController();
       const timeoutId = window.setTimeout(() => controller.abort(), 8000);
       try {
-        const response = await fetch("/api/prompts", { signal: controller.signal });
+        const response = await fetch("/api/prompts", {
+          signal: controller.signal,
+          cache: "no-cache",
+        });
         if (!response.ok) throw new Error("Remote prompts unavailable");
         const data = await response.json();
         if (active && Array.isArray(data.prompts) && data.prompts.length > 0) {
@@ -365,7 +369,7 @@ function App() {
         }
       } catch {
         if (active) {
-          setPrompts(readStoredPrompts());
+          setPrompts((current) => (current.length ? current : readStoredPrompts()));
           setFeaturedIds(readFeaturedIds());
           setDataSource("local");
         }
@@ -382,9 +386,9 @@ function App() {
   }, []);
 
   useEffect(() => {
-    if (dataSource !== "local") return;
+    if (!prompts.length) return;
     localStorage.setItem(STORAGE_KEY, JSON.stringify(prompts));
-  }, [prompts, dataSource]);
+  }, [prompts]);
 
   const featuredPrompts = useMemo(() => {
     const selectedPrompts = featuredIds
@@ -394,9 +398,8 @@ function App() {
   }, [featuredIds, prompts]);
 
   useEffect(() => {
-    if (dataSource !== "local") return;
     localStorage.setItem(FEATURED_KEY, JSON.stringify(featuredIds.slice(0, 5)));
-  }, [featuredIds, dataSource]);
+  }, [featuredIds]);
 
   useEffect(() => {
     if (!featuredPrompts.length) return undefined;
@@ -523,9 +526,9 @@ function App() {
   }
 
   async function refreshPromptsFromRemote() {
-    if (dataSource !== "feishu") return;
+    if (dataSource === "local") return;
     try {
-      const response = await fetch("/api/prompts");
+      const response = await fetch("/api/prompts", { cache: "no-store" });
       const data = await response.json().catch(() => ({}));
       if (!response.ok || !Array.isArray(data.prompts)) return;
       setPrompts(data.prompts);
@@ -544,7 +547,7 @@ function App() {
     });
   }
 
-  async function uploadFileToUrl(file) {
+  async function uploadFileToUrl(file, createThumbnail = false) {
     if (!file) return;
     return new Promise((resolve) => {
       const reader = new FileReader();
@@ -554,17 +557,20 @@ function App() {
           const response = await adminFetch("/api/uploads", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ dataUrl, filename: file.name }),
+            body: JSON.stringify({ dataUrl, filename: file.name, createThumbnail }),
           });
           if (!response.ok) {
             const message = await response.json().catch(() => ({}));
             throw new Error(message.error || "图片上传失败");
           }
           const data = await response.json();
-          resolve(data.url || "");
+          resolve({
+            url: data.url || "",
+            thumbnailUrl: data.thumbnailUrl || "",
+          });
         } catch (error) {
           window.alert(error instanceof Error ? error.message : "图片上传失败");
-          resolve("");
+          resolve(null);
         }
       };
       reader.readAsDataURL(file);
@@ -574,10 +580,26 @@ function App() {
   async function uploadImagesToField(files, field, limit = Infinity) {
     const imageFiles = Array.from(files || []).filter((file) => file.type.startsWith("image/"));
     if (!imageFiles.length) return;
-    const urls = (await Promise.all(imageFiles.map((file) => uploadFileToUrl(file)))).filter(Boolean);
+    const createThumbnails = field === "resultImagesInput";
+    const uploads = (
+      await Promise.all(
+        imageFiles.map((file) => uploadFileToUrl(file, createThumbnails))
+      )
+    ).filter((item) => item?.url);
+    const urls = uploads.map((item) => item.url);
+    const thumbnailUrls = uploads.map((item) => item.thumbnailUrl).filter(Boolean);
     setForm((current) => ({
       ...current,
       [field]: appendLines(current[field], urls, limit),
+      ...(createThumbnails
+        ? {
+            resultThumbnailsInput: appendLines(
+              current.resultThumbnailsInput,
+              thumbnailUrls,
+              limit
+            ),
+          }
+        : {}),
     }));
   }
 
@@ -614,7 +636,10 @@ function App() {
   async function insertImagesIntoText(files, field, selectionStart, selectionEnd) {
     const imageFiles = Array.from(files || []).filter((file) => file.type.startsWith("image/"));
     if (!imageFiles.length) return;
-    const urls = (await Promise.all(imageFiles.map((file) => uploadFileToUrl(file)))).filter(Boolean);
+    const uploads = (
+      await Promise.all(imageFiles.map((file) => uploadFileToUrl(file, false)))
+    ).filter((item) => item?.url);
+    const urls = uploads.map((item) => item.url);
     if (!urls.length) return;
     const insertText = urls.map((url) => `![图片](${url})`).join("\n\n");
 
@@ -654,9 +679,16 @@ function App() {
 
   async function uploadImageFile(file) {
     if (!file) return;
-    const url = await uploadFileToUrl(file);
-    if (!url) return;
-    updateForm("resultImagesInput", appendLines(form.resultImagesInput, [url]));
+    const upload = await uploadFileToUrl(file, true);
+    if (!upload?.url) return;
+    setForm((current) => ({
+      ...current,
+      resultImagesInput: appendLines(current.resultImagesInput, [upload.url]),
+      resultThumbnailsInput: appendLines(
+        current.resultThumbnailsInput,
+        [upload.thumbnailUrl].filter(Boolean)
+      ),
+    }));
   }
 
   async function uploadImageUrl(url) {
@@ -714,6 +746,7 @@ function App() {
       english: englishPrompt,
       tags: parseTags(form.tagsInput),
       image: parseLines(form.resultImagesInput)[0] || "",
+      thumbnailImage: parseLines(form.resultThumbnailsInput)[0] || "",
       images: parseLines(form.resultImagesInput),
       referenceImages: parseLines(form.referenceImagesInput).slice(0, 8),
       detailText: form.processText.trim(),
@@ -721,7 +754,7 @@ function App() {
       createdAt: new Date().toISOString(),
     };
 
-    if (dataSource === "feishu") {
+    if (dataSource !== "local") {
       const response = await adminFetch("/api/prompts", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -814,7 +847,7 @@ function App() {
     const previousIds = featuredIds;
     setFeaturedIds(nextIds);
 
-    if (dataSource !== "feishu") {
+    if (dataSource === "local") {
       localStorage.setItem(FEATURED_KEY, JSON.stringify(nextIds.slice(0, 5)));
       return;
     }
@@ -1152,7 +1185,12 @@ function FeaturedPicker({ prompts, selectedIds, isSaving, onToggle, onClose }) {
               onClick={() => onToggle(item.id)}
             >
               {item.image ? (
-                <img src={item.image} alt={item.title || "精选候选图"} />
+                <img
+                  src={item.thumbnailImage || item.image}
+                  alt={item.title || "精选候选图"}
+                  loading="lazy"
+                  decoding="async"
+                />
               ) : (
                 <span className="featured-option-empty">
                   <ImagePlus size={18} />
@@ -1441,7 +1479,11 @@ function HeroPoster({ prompts, total, featuredIndex, onFeaturedChange, onOpen })
           <div className="featured-accent" />
           <div className="featured-ribbon">精选推荐</div>
           {featured?.image ? (
-            <img src={featured.image} alt={featured.title || "精选提示词预览图"} />
+            <img
+              src={featured.thumbnailImage || featured.image}
+              alt={featured.title || "精选提示词预览图"}
+              decoding="async"
+            />
           ) : (
             <div className="featured-empty">
               <ImagePlus size={32} />
@@ -1553,9 +1595,10 @@ function PromptCard({ item, packed, onOpen }) {
       {item.image ? (
         <img
           className="preview-image"
-          src={item.image}
+          src={item.thumbnailImage || item.image}
           alt={item.title || "提示词预览图"}
           loading="lazy"
+          decoding="async"
         />
       ) : (
         <div className="preview-placeholder">

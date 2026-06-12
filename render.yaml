@@ -26,6 +26,10 @@ services:
         sync: false
       - key: FEISHU_VIEW_ID
         sync: false
+      - key: FEISHU_CACHE_TTL_MS
+        value: "60000"
+      - key: FEISHU_CACHE_STALE_MS
+        value: "900000"
       - key: FEISHU_FIELD_TITLE
         sync: false
       - key: FEISHU_FIELD_UPLOADER

@@ -1,6 +1,7 @@
 import { PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
 import { randomUUID } from "node:crypto";
 import { extname } from "node:path";
+import sharp from "sharp";
 import { loadEnvFile } from "./env.mjs";
 
 loadEnvFile();
@@ -50,7 +51,11 @@ function buildPublicUrl(key) {
   return `${baseUrl}/${key}`;
 }
 
-export async function uploadDataUrlToR2(dataUrl, filename = "image.png") {
+export async function uploadDataUrlToR2(
+  dataUrl,
+  filename = "image.png",
+  { createThumbnail = true } = {}
+) {
   const bucket = requiredEnv("R2_BUCKET");
   const { mime, buffer } = parseDataUrl(dataUrl);
   const rawExtension = extname(filename).toLowerCase();
@@ -59,16 +64,52 @@ export async function uploadDataUrlToR2(dataUrl, filename = "image.png") {
     .replace(/\.[^.]+$/, "")
     .replace(/[^\w.-]+/g, "-")
     .slice(0, 80);
-  const key = `prompt-images/${new Date().toISOString().slice(0, 10)}/${Date.now()}-${safeBaseName || randomUUID()}${extension}`;
+  const keyBase = `prompt-images/${new Date().toISOString().slice(0, 10)}/${Date.now()}-${safeBaseName || randomUUID()}`;
+  const key = `${keyBase}${extension}`;
+  const thumbnailKey = `${keyBase}-thumb.webp`;
+  const cacheControl = "public, max-age=31536000, immutable";
 
-  await getR2Client().send(
-    new PutObjectCommand({
-      Bucket: bucket,
-      Key: key,
-      Body: buffer,
-      ContentType: mime,
-    })
-  );
+  const uploads = [
+    getR2Client().send(
+      new PutObjectCommand({
+        Bucket: bucket,
+        Key: key,
+        Body: buffer,
+        ContentType: mime,
+        CacheControl: cacheControl,
+      })
+    ),
+  ];
 
-  return buildPublicUrl(key);
+  if (createThumbnail) {
+    const thumbnailBuffer = await sharp(buffer, { animated: false })
+      .rotate()
+      .resize({
+        width: 720,
+        height: 960,
+        fit: "inside",
+        withoutEnlargement: true,
+      })
+      .webp({ quality: 72, effort: 4 })
+      .toBuffer();
+
+    uploads.push(
+      getR2Client().send(
+        new PutObjectCommand({
+          Bucket: bucket,
+          Key: thumbnailKey,
+          Body: thumbnailBuffer,
+          ContentType: "image/webp",
+          CacheControl: cacheControl,
+        })
+      )
+    );
+  }
+
+  await Promise.all(uploads);
+
+  return {
+    url: buildPublicUrl(key),
+    thumbnailUrl: createThumbnail ? buildPublicUrl(thumbnailKey) : "",
+  };
 }

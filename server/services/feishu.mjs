@@ -26,6 +26,12 @@ const fieldNames = {
 
 let cachedTenantToken = null;
 let tenantTokenExpiresAt = 0;
+let cachedPrompts = null;
+let promptsCachedAt = 0;
+let promptsRefreshPromise = null;
+
+const promptsCacheTtlMs = Number(process.env.FEISHU_CACHE_TTL_MS || 60_000);
+const promptsCacheStaleMs = Number(process.env.FEISHU_CACHE_STALE_MS || 15 * 60_000);
 
 function requiredEnv(name) {
   const value = process.env[name];
@@ -162,6 +168,10 @@ function hasContent(fields) {
   ].some((name) => normalizeText(fields[name]).trim());
 }
 
+function isThumbnailUrl(value) {
+  return /-thumb\.webp(?:$|[?#])/i.test(String(value || ""));
+}
+
 function mapRecord(record) {
   const fields = record.fields || {};
   const detailImages = normalizeImages(fields[fieldNames.detailImages]);
@@ -172,7 +182,9 @@ function mapRecord(record) {
     ? normalizeImages(fields[fieldNames.detailContentImages])
     : [];
   const coverImages = normalizeImages(fields[fieldNames.cover]);
-  const image = coverImages[0] || detailImages[0] || "";
+  const thumbnailImage = coverImages.find(isThumbnailUrl) || "";
+  const originalCoverImages = coverImages.filter((url) => !isThumbnailUrl(url));
+  const image = originalCoverImages[0] || detailImages[0] || "";
 
   return {
     id: record.record_id,
@@ -185,7 +197,8 @@ function mapRecord(record) {
     english: normalizeText(fields[fieldNames.english]),
     tags: normalizeTags(fields[fieldNames.tags]),
     image,
-    images: Array.from(new Set([...coverImages, ...detailImages])).filter(Boolean),
+    thumbnailImage,
+    images: Array.from(new Set([...originalCoverImages, ...detailImages])).filter(Boolean),
     referenceImages,
     detailText: fieldNames.detailText ? normalizeText(fields[fieldNames.detailText]) : "",
     detailImages: detailContentImages,
@@ -225,16 +238,83 @@ async function loadRecordsFromFeishu() {
   return records;
 }
 
-export async function loadPromptsFromFeishu() {
-  const records = await loadRecordsFromFeishu();
+async function refreshPromptsCache() {
+  if (promptsRefreshPromise) return promptsRefreshPromise;
 
-  return records
-    .filter((record) => {
-      const fields = record.fields || {};
-      return hasContent(fields) && shouldPublish(fields);
-    })
-    .map(mapRecord)
-    .sort((a, b) => b.sort - a.sort || new Date(b.createdAt) - new Date(a.createdAt));
+  promptsRefreshPromise = (async () => {
+    const records = await loadRecordsFromFeishu();
+    const prompts = records
+      .filter((record) => {
+        const fields = record.fields || {};
+        return hasContent(fields) && shouldPublish(fields);
+      })
+      .map(mapRecord)
+      .sort((a, b) => b.sort - a.sort || new Date(b.createdAt) - new Date(a.createdAt));
+
+    cachedPrompts = prompts;
+    promptsCachedAt = Date.now();
+    return prompts;
+  })().finally(() => {
+    promptsRefreshPromise = null;
+  });
+
+  return promptsRefreshPromise;
+}
+
+function upsertPromptCache(prompt) {
+  if (!prompt || !cachedPrompts) return;
+  const existing = cachedPrompts.find((item) => item.id === prompt.id);
+  const mergedPrompt = existing
+    ? {
+        ...existing,
+        ...prompt,
+        title: prompt.title || existing.title,
+        uploader: prompt.uploader || existing.uploader,
+        type: prompt.type || existing.type,
+        tool: prompt.tool || existing.tool,
+        medium: prompt.medium || existing.medium,
+        chinese: prompt.chinese || existing.chinese,
+        english: prompt.english || existing.english,
+        tags: prompt.tags?.length ? prompt.tags : existing.tags,
+        image: prompt.image || existing.image,
+        thumbnailImage: prompt.thumbnailImage || existing.thumbnailImage,
+        images: prompt.images?.length ? prompt.images : existing.images,
+        referenceImages: prompt.referenceImages?.length
+          ? prompt.referenceImages
+          : existing.referenceImages,
+        detailText: prompt.detailText || existing.detailText,
+        detailImages: prompt.detailImages?.length ? prompt.detailImages : existing.detailImages,
+      }
+    : prompt;
+
+  cachedPrompts = [
+    mergedPrompt,
+    ...cachedPrompts.filter((item) => item.id !== prompt.id),
+  ].sort(
+    (a, b) => b.sort - a.sort || new Date(b.createdAt) - new Date(a.createdAt)
+  );
+  promptsCachedAt = Date.now();
+}
+
+export async function loadPromptsFromFeishu({ force = false } = {}) {
+  const age = Date.now() - promptsCachedAt;
+
+  if (!force && cachedPrompts && age < promptsCacheTtlMs) {
+    return cachedPrompts;
+  }
+
+  if (!force && cachedPrompts && age < promptsCacheStaleMs) {
+    refreshPromptsCache().catch((error) => {
+      console.warn(
+        `Background Feishu refresh failed: ${
+          error instanceof Error ? error.message : "Unknown error"
+        }`
+      );
+    });
+    return cachedPrompts;
+  }
+
+  return refreshPromptsCache();
 }
 
 export async function updateFeaturedPromptsInFeishu(ids = []) {
@@ -270,7 +350,7 @@ export async function updateFeaturedPromptsInFeishu(ids = []) {
     )
   );
 
-  return loadPromptsFromFeishu();
+  return loadPromptsFromFeishu({ force: true });
 }
 
 export async function updatePromptTranslationInFeishu(recordId, translation = {}) {
@@ -300,7 +380,9 @@ export async function updatePromptTranslationInFeishu(recordId, translation = {}
     }
   );
 
-  return mapRecord(data.data?.record || data.data || { record_id: id, fields });
+  const prompt = mapRecord(data.data?.record || data.data || { record_id: id, fields });
+  upsertPromptCache(prompt);
+  return prompt;
 }
 
 export async function createPromptInFeishu(input) {
@@ -309,6 +391,8 @@ export async function createPromptInFeishu(input) {
   const token = await getTenantAccessToken();
   const tags = toFeishuTags(input.tags || input.tagsInput);
   const coverUrl = toFeishuText(input.image);
+  const thumbnailUrl = toFeishuText(input.thumbnailImage);
+  const coverValue = [coverUrl, thumbnailUrl].filter(Boolean).join("\n");
   const detailImages = toImageLines(input.images || input.detailImages || input.detailImagesInput);
   const referenceImages = toImageLines(input.referenceImages || input.referenceImagesInput);
   const detailText = toFeishuText(input.detailText);
@@ -333,7 +417,7 @@ export async function createPromptInFeishu(input) {
     [fieldNames.chinese]: chinesePrompt,
     [fieldNames.english]: englishPrompt,
     [fieldNames.tags]: tags,
-    [fieldNames.cover]: coverUrl,
+    [fieldNames.cover]: coverValue,
     [fieldNames.detailImages]: detailImages,
     [fieldNames.status]: toFeishuText(input.status) || "已发布",
     [fieldNames.sort]: Number(input.sort) || 0,
@@ -368,5 +452,9 @@ export async function createPromptInFeishu(input) {
     }
   );
 
-  return mapRecord(data.data?.record || data.data || { record_id: `created-${Date.now()}`, fields });
+  const prompt = mapRecord(
+    data.data?.record || data.data || { record_id: `created-${Date.now()}`, fields }
+  );
+  upsertPromptCache(prompt);
+  return prompt;
 }

@@ -22,12 +22,13 @@ const googleTranslateTimeoutMs = Number(process.env.GOOGLE_TRANSLATE_TIMEOUT_MS 
 const baiduTranslateTimeoutMs = Number(process.env.BAIDU_TRANSLATE_TIMEOUT_MS || 12_000);
 const customTranslateTimeoutMs = Number(process.env.TRANSLATION_API_TIMEOUT_MS || 12_000);
 
-function sendJson(response, statusCode, payload) {
+function sendJson(response, statusCode, payload, extraHeaders = {}) {
   response.writeHead(statusCode, {
     "Content-Type": "application/json; charset=utf-8",
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Methods": "GET, POST, PUT, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization",
+    ...extraHeaders,
   });
   response.end(JSON.stringify(payload));
 }
@@ -285,7 +286,12 @@ const server = http.createServer(async (request, response) => {
 
     if (request.method === "GET" && url.pathname === "/api/prompts") {
       const prompts = await loadPromptsFromFeishu();
-      sendJson(response, 200, { source: "feishu", prompts });
+      sendJson(
+        response,
+        200,
+        { source: "feishu", prompts },
+        { "Cache-Control": "private, max-age=15, stale-while-revalidate=60" }
+      );
       return;
     }
 
@@ -321,8 +327,10 @@ const server = http.createServer(async (request, response) => {
     if (request.method === "POST" && url.pathname === "/api/uploads") {
       if (!requireAdmin(request, response)) return;
       const body = await readJsonBody(request);
-      const uploadedUrl = await uploadDataUrlToR2(body.dataUrl, body.filename);
-      sendJson(response, 201, { url: uploadedUrl });
+      const upload = await uploadDataUrlToR2(body.dataUrl, body.filename, {
+        createThumbnail: body.createThumbnail !== false,
+      });
+      sendJson(response, 201, upload);
       return;
     }
 
